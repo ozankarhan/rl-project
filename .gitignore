@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual env
+.venv/
+
+# Install / run logs (kept out of the repo; learning-curve CSVs ARE tracked)
+install.log
+logs/*.out
+
+# Temporary sweep/smoke weights (final per-method weights ARE tracked)
+weights/_*.pt
+
+# OS
+Thumbs.db
+.DS_Store

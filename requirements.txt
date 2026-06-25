@@ -1,0 +1,11 @@
+# IE 306 Term Project — Role B (policy-based: REINFORCE+GAE, A2C, DDPG)
+# Single-command setup:  pip install -r requirements.txt
+# (installs the course simulator in editable mode + the RL stack)
+
+-e ./drone_dispatch_env
+
+torch>=2.2
+numpy>=1.24,<2.0
+pyyaml>=6.0
+matplotlib>=3.7
+gymnasium>=0.29
