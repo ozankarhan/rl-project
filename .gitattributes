@@ -1,0 +1,6 @@
+# Normalize line endings: store text files as LF in the repo (GitHub renders
+# them multi-line); check out with native EOL on each platform.
+* text=auto
+
+# Shell scripts must stay LF even on Windows checkouts (CRLF breaks bash).
+*.sh text eol=lf
