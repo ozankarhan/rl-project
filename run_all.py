@@ -7,6 +7,9 @@ the continuous DroneControl-v0 sub-env.
 
     python run_all.py --config drone_dispatch_env/configs/eval_standard.yaml --seeds 0,1,2,3,4
 
+Add --per-seed to also print the mean +/- std across the per-seed checkpoints
+(the >=3-seed robustness view), in addition to the best-checkpoint tables above.
+
 Both --config and --seeds are overridable so this runs unchanged on a held-out
 config / held-out seeds. The learned dispatch net is dimension-robust, so the same
 weights load even if the config changes k_max / grid size.
@@ -46,15 +49,20 @@ def _canonical(method: str) -> str | None:
     seedfiles = sorted(glob.glob(f"weights/{method}_seed*.pt"))
     if not seedfiles:
         return None
-    key = "return" if method == "ddpg" else "cost_per_order"
-    lower_better = method != "ddpg"
+    if method == "ddpg":
+        # prioritise reaching the target (success), then return
+        score_of = lambda ck: (ck.get("success_rate", -1.0), ck.get("return", -float("inf")))
+        better = lambda v, bv: v > bv
+    else:
+        score_of = lambda ck: ck.get("cost_per_order", float("inf"))
+        better = lambda v, bv: v < bv
     best, best_val = None, None
     for f in seedfiles:
         ck = torch.load(f, map_location="cpu")
-        val = ck.get(key) if isinstance(ck, dict) else None
-        if val is None:
+        if not isinstance(ck, dict):
             continue
-        if best_val is None or (val < best_val if lower_better else val > best_val):
+        val = score_of(ck)
+        if best_val is None or better(val, best_val):
             best_val, best = val, f
     best = best or seedfiles[0]
     shutil.copyfile(best, canon)
@@ -142,10 +150,58 @@ def _print_control(rows: dict):
         print(f"\n  DDPG return {d['return']:.2f} vs go-straight {gs['return']:.2f} -> {verdict}")
 
 
+def _seed_files(method: str) -> list[str]:
+    return sorted(glob.glob(f"weights/{method}_seed*.pt"))
+
+
+def dispatch_per_seed(cfg: Config, seeds: list[int]) -> dict:
+    """cost_per_order for each per-seed dispatch checkpoint (mean over eval seeds)."""
+    out = {}
+    for method in ["reinforce", "a2c"]:
+        vals = [evaluate(load_dispatch_agent(f, cfg), cfg, seeds)["mean"]["cost_per_order"]
+                for f in _seed_files(method)]
+        if vals:
+            out[method] = vals
+    return out
+
+
+def control_per_seed(cfg: Config, seeds: list[int]) -> dict:
+    """return / success for each per-seed DDPG checkpoint (mean over eval seeds)."""
+    rets, succ = [], []
+    for f in _seed_files("ddpg"):
+        ck = torch.load(f, map_location="cpu")
+        actor = DDPGActor(ck["obs_dim"], ck.get("hidden", 256))
+        actor.load_state_dict(ck["state_dict"])
+        actor.eval()
+        act_fn = lambda o, a=actor: a(torch.as_tensor(o, dtype=torch.float32)).numpy()
+        r = _run_control(act_fn, cfg, seeds)
+        rets.append(r["return"])
+        succ.append(r["success_rate"])
+    return {"return": rets, "success_rate": succ}
+
+
+def _print_per_seed(disp: dict, ctrl: dict):
+    print("\n=== Seed robustness: mean +/- std across the trained seeds (>=3) ===")
+    print("DroneDispatch-v0 cost_per_order (lower better):")
+    for method, vals in disp.items():
+        arr = np.array(vals)
+        per = ", ".join(f"{v:.3f}" for v in vals)
+        print(f"  {method:<12} {arr.mean():>8.3f} +/- {arr.std():<7.3f} (per-seed: {per})")
+    if ctrl.get("return"):
+        r, s = np.array(ctrl["return"]), np.array(ctrl["success_rate"])
+        rper = ", ".join(f"{v:.1f}" for v in ctrl["return"])
+        sper = ", ".join(f"{v:.2f}" for v in ctrl["success_rate"])
+        print("DroneControl-v0 DDPG (return higher better):")
+        print(f"  {'return':<12} {r.mean():>8.2f} +/- {r.std():<7.2f} (per-seed: {rper})")
+        print(f"  {'success':<12} {s.mean():>8.3f} +/- {s.std():<7.3f} (per-seed: {sper})")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="drone_dispatch_env/configs/eval_standard.yaml")
     ap.add_argument("--seeds", default="0,1,2,3,4")
+    ap.add_argument("--per-seed", action="store_true",
+                    help="also print mean +/- std across the per-seed checkpoints")
     args = ap.parse_args()
 
     cfg = Config.from_yaml(args.config)
@@ -154,6 +210,8 @@ def main():
 
     _print_dispatch(dispatch_table(cfg, seeds))
     _print_control(control_table(cfg, seeds))
+    if args.per_seed:
+        _print_per_seed(dispatch_per_seed(cfg, seeds), control_per_seed(cfg, seeds))
 
 
 if __name__ == "__main__":
