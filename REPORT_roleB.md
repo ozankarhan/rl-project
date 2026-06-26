@@ -56,14 +56,23 @@ a 169-wide output layer would fail to load if `k_max` or the grid size change. W
 
 **Routed-distance features.** For each (drone, order) we feed the **no-fly-aware BFS routed
 distance** (drone→pickup, pickup→dropoff trip length), the steps-to-deadline, and battery- and
-deadline-feasibility flags — computed only from `obs["grid"]` via the simulator's public
-`Router`, memoised once per source cell per episode. This gives the policy the *same* distance
+deadline-feasibility flags — computed only from `obs["grid"]` via a self-contained BFS router
+(`code/role_b/routing.py`, with no dependency on simulator internals), memoised once per source
+cell per episode. This gives the policy the *same* distance
 information `greedy_nearest` uses, which is what makes beating it feasible.
 
 ### 3.2 REINFORCE + GAE
 Monte-Carlo policy gradient with a learned value baseline; the return is replaced by a GAE(λ)
 advantage. Collect complete episodes, compute GAE per episode, one gradient step per batch with a
-value-MSE term and an entropy bonus. This is the high-variance stepping stone to A2C.
+value (Huber) term and an entropy bonus.
+
+**Behavior-cloning warm-start.** Plain REINFORCE is high-variance: from a random init it
+(seed-dependently) gets stuck in a no-/half-delivery local optimum, so only ~1/3 of seeds reach a
+greedy-beating policy. We fix this by first **cloning `greedy_nearest`** into the policy (a short
+supervised phase — cross-entropy to greedy's masked action over a fixed greedy dataset), which
+puts *every* seed in the delivering regime; REINFORCE then reliably refines the policy **below**
+greedy. With the clone plus lr decay and an extra critic-fit per update, all three seeds converge
+to cost ≈ 2.6 (§6).
 
 ### 3.3 A2C
 The synchronous advantage actor–critic: identical net, but instead of full episodes it collects
@@ -71,9 +80,13 @@ fixed n-step rollouts and **bootstraps** the advantage with the critic's value o
 the rollout (GAE-λ). Lower variance, more sample-efficient.
 
 ### 3.4 DDPG (continuous control sub-env)
-Deterministic actor (speed∈[0,1] via sigmoid, heading-delta∈[−1,1] via tanh) + Q-critic, target
-networks with Polyak averaging, a replay buffer, additive Gaussian exploration, and a random
-warm-up phase. Graded against go-straight on return / success / energy.
+Deterministic actor (speed∈[0.3,1] via sigmoid+floor, heading-delta∈[−1,1] via tanh) + Q-critic,
+target networks with Polyak averaging, a replay buffer, Ornstein–Uhlenbeck exploration that decays
+over training, and a random warm-up phase. **Checkpoints are selected on validation success-rate
+(then return)**, so the policy that actually reaches the target is the one we keep. We also
+implement the **TD3** stabilisation (clipped double-Q, target-policy smoothing, delayed actor
+updates; Fujimoto et al. 2018) as a config-gated option for seed robustness. Graded against
+go-straight on return / success.
 
 ## 4. Method-origin note (citations)
 
@@ -88,6 +101,9 @@ warm-up phase. Graded against go-straight on return / success / energy.
 - **DDPG** — Lillicrap et al. (2016), *Continuous control with deep reinforcement learning*.
   Chosen because the control sub-env has a genuinely continuous action (speed, heading), which is
   DDPG's native setting.
+- **TD3** — Fujimoto et al. (2018), *Addressing Function Approximation Error in Actor-Critic
+  Methods*. Added as a config-gated stabiliser (clipped double-Q, target-policy smoothing, delayed
+  actor updates) to reduce DDPG's across-seed variance.
 
 ## 5. Experimental setup
 
@@ -95,7 +111,7 @@ warm-up phase. Graded against go-straight on return / success / energy.
   `python code/role_b/train_a2c.py --config configs/a2c.yaml --seed 0`.
 - **Seed hygiene / generalization:** training draws fresh episode seeds from a high disjoint pool
   (≥10 000); checkpoints are selected on **validation seeds 200–202**; the reported tables use
-  `--seeds` (default 0–4). Nothing is tuned to a specific seed, and grading runs on held-out
+  `--seeds` (default 0–4). The dispatch hyperparameters are shared across all seeds; DDPG's exploration noise is the one seed-sensitive exception (§7). Grading runs on held-out
   seeds/config via `run_all.py --config ... --seeds ...`.
 - ≥3 seeds per method; learning curves are mean ± std (see `figures/`).
 - Reproduce everything: `python run_all.py --config drone_dispatch_env/configs/eval_standard.yaml --seeds 0,1,2,3,4`.
@@ -111,15 +127,29 @@ best of 3 seeds, selected on validation seeds 200–202.
 | random | 18.498 | 0.659 | 0.897 | 8.00 | 40.0 | 21.2 |
 | greedy_nearest | 4.309 | 0.858 | 0.906 | 3.60 | 120.0 | 19.8 |
 | milp_rolling | 4.282 | 0.853 | 0.910 | 3.20 | 120.6 | 20.6 |
-| **REINFORCE+GAE** | **2.636** | 0.884 | 0.809 | 0.60 | 122.6 | 16.4 |
+| **REINFORCE+GAE** | **2.565** | 0.907 | 0.941 | 1.80 | 128.8 | 13.4 |
 | **A2C** | **1.735** | 0.955 | 0.847 | 1.60 | 134.0 | 6.4 |
 
 Both policy-gradient methods beat greedy_nearest and MILP. **A2C wins decisively (1.735 — a 60%
 lower cost per order than greedy):** it delivers *more* orders (134 vs 120), drops 3× fewer
 (6.4 vs 19.8), and cuts the depletions that dominate greedy's cost (1.6 vs 3.6) — exactly the
-headroom identified in §2. REINFORCE+GAE also beats greedy (2.636) on its best seed but is
-high-variance across seeds (§9): one seed reached ≈2.2, another diverged past 100. That spread is
-the textbook Monte-Carlo-variance motivation for the bootstrapped A2C.
+headroom identified in §2. **REINFORCE+GAE also beats greedy decisively (2.565)** and — thanks to
+the behavior-cloning warm-start (§3.2) — now does so *reliably on every seed* (2.65 ± 0.09, §9),
+not just its best one. A2C still reaches the lowest cost with the least compute — the textbook
+payoff of bootstrapping over high-variance Monte-Carlo returns.
+
+**Seed robustness: mean ± std over the 3 trained seeds (eval seeds 0-4)**, reproduced with
+`run_all.py --per-seed`. The headline table reports the *best* of 3 seeds (selected on validation);
+the full spread is:
+
+| method | cost_per_order (mean ± std) | per-seed |
+|--------|----------------------------:|----------|
+| REINFORCE+GAE | 2.65 ± 0.09 | 2.77 / 2.61 / 2.57 |
+| A2C | 1.55 ± 0.21 | 1.26 / 1.64 / 1.74 |
+
+Both methods now beat greedy (4.31) on **all three seeds**. The behavior-cloning warm-start turned
+REINFORCE from a 1/3-reliable, high-variance learner (previously **48.98 ± 50.36**, per-seed
+25.3 / 119.0 / 2.6) into a tight **2.65 ± 0.09**; A2C remains the most sample-efficient.
 
 **Robustness to a held-out config.** Because the policy is factored / permutation-invariant, the
 *same* standard-config weights load and run on a structurally different config — verified on a
@@ -134,33 +164,40 @@ generalizes better there (return −44.6 vs go-straight −1511).
 | policy | return | success_rate | mean_steps |
 |--------|-------:|-------------:|-----------:|
 | go_straight | −417.4 | 0.80 | 28.4 |
-| **DDPG** (best seed) | **−149.6** | 0.20 | 223.4 |
+| **DDPG** (best seed) | **+20.7** | **1.00** | 17.0 |
 
-DDPG beats go-straight on **return** (the primary metric) on every seed: go-straight reaches
-targets but repeatedly crashes into no-fly cells (−25 each), wrecking its return, while DDPG learns
-a collision-aware policy. The honest weak spot is **success rate** (exact target arrival): the
-checkpoint selected on validation return is conservative (best seed 0.20 on eval seeds, up to 0.80
-late in training). See §9 for the don't-move-optimum diagnosis and the OU-noise + speed-floor fixes.
+DDPG now **beats go-straight on both metrics decisively**: it reaches the target on **every** eval
+episode (success 1.00 vs 0.80) while go-straight crashes into no-fly cells (−25 each), so DDPG's
+return is *positive* (+20.7) against go-straight's −417.4. Selecting the checkpoint on validation
+**success** (§3.4) rather than return is what captures the target-reaching policy — it appears late
+in training and was previously discarded.
+
+**Seed robustness: mean ± std over the 3 trained seeds (eval seeds 0-4)**, via `run_all.py
+--per-seed`: **success 1.00 ± 0.00** (per-seed 1.00 / 1.00 / 1.00 — every seed reaches the target
+on every held-out episode), return **−21.4 ± 62.6** (per-seed +24.9 / −109.8 / +20.7; all far above
+go-straight's −417.4). DDPG is exploration-noise sensitive across seeds (a known DDPG trait, §9):
+seed 0 trains best with lower OU noise (0.2), seeds 1–2 with higher (0.3); the TD3 variant reaches
+the same 1.00 success. All three checkpoints generalise to 100% success on the held-out eval.
 
 ## 8. Ablation — GAE λ sweep on A2C (required)
 
-We sweep λ ∈ {0.0, 0.9, 0.95, 0.99, 1.0} on A2C (2 seeds each, 40k steps). We run the sweep on A2C
+We sweep λ ∈ {0.0, 0.9, 0.95, 0.99, 1.0} on A2C (3 seeds each, 40k steps). We run the sweep on A2C
 rather than REINFORCE because A2C is stable, so the λ effect is not swamped by Monte-Carlo seed
 variance. Best validation `cost_per_order` per λ (`figures/ablation_gae.png`):
 
 | GAE λ | mean best cost_per_order |
 |-------|-------------------------:|
-| 0.0 | 13.82 |
-| 0.9 | 0.77 |
-| 0.95 | **0.76** |
-| 0.99 | 0.89 |
-| 1.0 | 0.90 |
+| 0.0 | 13.85 |
+| 0.9 | 0.75 |
+| 0.95 | **0.69** |
+| 0.99 | 0.80 |
+| 1.0 | 1.11 |
 
 This is the textbook bias/variance tradeoff. **λ = 0** uses the one-step TD advantage
 `r + γV(s′) − V(s)` — minimal variance but maximal bias, so credit is assigned too myopically and the
 policy never beats greedy (13.8 ≫ 4.31). **λ = 0.9–0.95** balances bias and variance and is optimal
-(≈0.76). Pushing to **λ = 1.0** (the Monte-Carlo advantage — unbiased but high-variance) slightly
-degrades it (0.90). This validates the GAE(0.95) default used for the headline A2C/REINFORCE runs.
+(≈0.69). Pushing to **λ = 1.0** (the Monte-Carlo advantage — unbiased but high-variance) slightly
+degrades it (1.11). This validates the GAE(0.95) default used for the headline A2C/REINFORCE runs.
 
 ## 9. Engineering log — what broke and how we diagnosed it
 
@@ -185,16 +222,21 @@ degrades it (0.90). This validates the GAE(0.95) default used for the headline A
   charge. Fix: scale rewards ×0.1 and use a Huber (smooth-L1) value/critic loss. `value_loss`
   dropped to ≈ 5 and A2C immediately learned to charge (zero depletions) and beat greedy within
   ~10k steps. This single fix turned a non-working agent into the headline result.
-- **DDPG "don't-move" local optimum.** DDPG converged to barely moving (return ≈ −10, 0% success):
-  with a −25 wall-collision penalty, hovering beats risky movement, and i.i.d. exploration on a
-  *turn-rate* action just spins in place without reaching the target. Fixes, in order of impact:
-  (i) the reward-scaling fix above (the Q-targets were also exploding); (ii) Ornstein–Uhlenbeck
-  temporally-correlated exploration so the drone commits to a heading; (iii) a minimum-speed floor
-  (0.3) that removes hovering as an option. After these, DDPG navigates: best return (−31 to −59)
-  beats go-straight (−417) on every seed, and the best seed reaches targets 80% of the time.
-  Training stays somewhat unstable across seeds (a known DDPG trait).
-- **REINFORCE variance.** With a working value function REINFORCE+GAE *can* beat greedy (best seed
-  cost ≈ 1.9), but it is high-variance: across seeds some converge and some diverge, and shrinking
-  the batch made it worse (a smaller batch = higher-variance gradient). This is the textbook
-  Monte-Carlo-variance motivation for the bootstrapped A2C — which is rock-solid here (all seeds
-  ≈ 0.5). The lever is a larger batch + more updates; full reliability across every seed stays hard.
+- **DDPG "don't-move" optimum, success-selection, and seed-variance.** DDPG first converged to
+  barely moving (0% success): with a −25 wall penalty, hovering beats risky movement and i.i.d.
+  noise on a *turn-rate* action just spins in place. Fixes: reward-scaling (the Q-targets were also
+  exploding), Ornstein–Uhlenbeck temporally-correlated exploration (decaying over training), and a
+  minimum-speed floor (0.3). The decisive reporting fix was **selecting the checkpoint on validation
+  success rather than return** — the high-success policy appears late in training and was previously
+  thrown away. DDPG stays exploration-noise sensitive across seeds (low noise suits seed 0, higher
+  noise seeds 1–2), so we also implemented **TD3** (clipped double-Q + target smoothing + delayed
+  updates) for robustness. Final: all three seeds reach **100% success** on held-out eval with
+  returns far above go-straight (§7).
+- **REINFORCE seed-variance — and the fix.** Plain REINFORCE+GAE beat greedy on only its best seed
+  (per-seed eval 25.3 / 119.0 / 2.6 → **48.98 ± 50.36**): two seeds got stuck in a no-/half-delivery
+  local optimum — the policy never commits (entropy stays high) because the Monte-Carlo advantages
+  are too noisy to identify good actions. Sweeping lr / batch / entropy / value-fits / lr-decay
+  across ~16 configs did **not** make it reliable. The fix that did: **behavior-clone
+  `greedy_nearest` first** (§3.2) so every seed starts already delivering, then let REINFORCE refine
+  below greedy. Result: all three seeds converge to **2.65 ± 0.09**. A2C needs no warm-start (its
+  bootstrapped advantages are low-variance) — the lesson of the REINFORCE→A2C progression.

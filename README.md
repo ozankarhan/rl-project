@@ -16,8 +16,9 @@ pip install -r requirements.txt # installs the editable simulator + torch
 python run_all.py --config drone_dispatch_env/configs/eval_standard.yaml --seeds 0,1,2,3,4
 ```
 Prints the dispatch comparison (vs random / greedy_nearest / milp_rolling; primary metric
-`cost_per_order`, lower is better) and the DDPG-vs-go-straight table. `--config` and `--seeds`
-are overridable, so this runs unchanged on a held-out config / held-out seeds. The learned
+`cost_per_order`, lower is better) and the DDPG-vs-go-straight table. Add `--per-seed` to also
+print the mean ± std across the 3 trained seeds per method (the seed-robustness view). `--config`
+and `--seeds` are overridable, so this runs unchanged on a held-out config / held-out seeds. The learned
 dispatch policy is dimension-robust and loads even if the config changes `k_max` / grid size.
 
 ## Retrain (optional)
