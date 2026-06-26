@@ -23,7 +23,7 @@ from __future__ import annotations
 import numpy as np
 
 from drone_dispatch_env.config import Config, NOFLY, CHARGER
-from drone_dispatch_env.world import Router
+from .routing import LocalRouter
 
 # drone row layout (env_dispatch._obs): [x, y, soc, alive, status_onehot(5), has_order]
 _D_X, _D_Y, _D_SOC, _D_ALIVE = 0, 1, 2, 3
@@ -50,7 +50,7 @@ class RoutedCache:
     def __init__(self, neighborhood: int = 4):
         self.neighborhood = neighborhood
         self._grid_key = None
-        self._router: Router | None = None
+        self._router: LocalRouter | None = None
         self._fields: dict[tuple[int, int], np.ndarray] = {}
         self._charger_field: np.ndarray | None = None
 
@@ -58,7 +58,7 @@ class RoutedCache:
         key = grid.tobytes()
         if key != self._grid_key:
             self._grid_key = key
-            self._router = Router(grid, self.neighborhood)
+            self._router = LocalRouter(grid, self.neighborhood)
             self._fields = {}
             chargers = np.argwhere(grid == CHARGER)
             if len(chargers) == 0:
